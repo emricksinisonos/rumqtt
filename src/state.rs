@@ -1,9 +1,9 @@
-use std::time::{Duration, Instant};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-use mqtt3;
 use crate::MqttOptions;
-use crate::error::*;
+use anyhow::{Result, anyhow};
+use mqtt3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MqttConnectionStatus {
@@ -55,7 +55,9 @@ impl MqttState {
     pub fn new(opts: MqttOptions) -> Self {
         MqttState {
             opts: opts,
-            connection_status: MqttConnectionStatus::WantConnect { when: Instant::now() },
+            connection_status: MqttConnectionStatus::WantConnect {
+                when: Instant::now(),
+            },
             await_pingresp: false,
             last_flush: Instant::now(),
             last_pkid: mqtt3::PacketIdentifier(0),
@@ -97,14 +99,17 @@ impl MqttState {
         use self::MqttConnectionStatus::*;
         use crate::ReconnectOptions::*;
         match (self.connection_status, self.opts.reconnect) {
-              (Handshake { initial: true }, Always(d))
-            | (Handshake {..}, AfterFirstSuccess(d))
+            (Handshake { initial: true }, Always(d))
+            | (Handshake { .. }, AfterFirstSuccess(d))
             | (Connected, AfterFirstSuccess(d))
             | (Connected, Always(d))
             | (WantConnect { .. }, AfterFirstSuccess(d))
-            | (WantConnect { .. }, Always(d))
-                => self.connection_status = WantConnect { when: Instant::now()+d },
-            _ => self.connection_status = Disconnected
+            | (WantConnect { .. }, Always(d)) => {
+                self.connection_status = WantConnect {
+                    when: Instant::now() + d,
+                }
+            }
+            _ => self.connection_status = Disconnected,
         }
     }
 
@@ -112,7 +117,7 @@ impl MqttState {
         let response = connack.code;
         if response != mqtt3::ConnectReturnCode::Accepted {
             self.set_status_after_error();
-            Err(ErrorKind::Connack(response))?
+            bail!(anyhow!("Got following return code {response:?}"))
         } else {
             self.connection_status = MqttConnectionStatus::Connected;
             if self.opts.clean_session {
@@ -123,7 +128,9 @@ impl MqttState {
         }
     }
 
-    pub fn handle_reconnection(&mut self) -> Option<(Option<mqtt3::Subscribe>, VecDeque<mqtt3::Publish>)> {
+    pub fn handle_reconnection(
+        &mut self,
+    ) -> Option<(Option<mqtt3::Subscribe>, VecDeque<mqtt3::Publish>)> {
         self.await_pingresp = false;
         self.reset_last_control_at();
         if self.opts.clean_session {
@@ -131,13 +138,16 @@ impl MqttState {
         } else {
             let sub = if self.subscriptions.len() > 0 {
                 Some(mqtt3::Subscribe {
-                    pid: self.next_pkid(), 
-                    topics: self.subscriptions.iter().map(|s| {
-                        ::mqtt3::SubscribeTopic {
+                    pid: self.next_pkid(),
+                    topics: self
+                        .subscriptions
+                        .iter()
+                        .map(|s| ::mqtt3::SubscribeTopic {
                             topic_path: s.topic_path.path.clone(),
                             qos: s.qos,
-                        }}).collect()
-            })
+                        })
+                        .collect(),
+                })
             } else {
                 None
             };
@@ -152,7 +162,7 @@ impl MqttState {
         mut publish: mqtt3::Publish,
     ) -> Result<mqtt3::Publish> {
         if publish.payload.len() > self.opts.max_packet_size {
-            Err(ErrorKind::PacketSizeLimitExceeded)?
+            bail!(anyhow!("Packet size limit exeeded"))
         }
         let publish = match publish.qos {
             mqtt3::QoS::AtMostOnce => publish,
@@ -176,7 +186,7 @@ impl MqttState {
             self.reset_last_control_at();
             Ok(publish)
         } else {
-            Err(ErrorKind::InvalidState.into())
+            bail!(anyhow!("Invalid state"))
         }
     }
 
@@ -188,7 +198,7 @@ impl MqttState {
             Ok(self.outgoing_pub.remove(index).unwrap())
         } else {
             error!("Unsolicited PUBLISH packet: {:?}", pkid);
-            Err(ErrorKind::InvalidState.into())
+            bail!(anyhow!("Invalid state"))
         }
     }
 
@@ -243,7 +253,7 @@ impl MqttState {
         let elapsed = self.last_flush.elapsed();
         if elapsed >= Duration::new(u64::from(keep_alive + 1), 0) {
             debug!("Might be too late for ping");
-            return Err(ErrorKind::InvalidState.into());
+            bail!(anyhow!("Invalid state"))
         }
         // @ Prevents half open connections. Tcp writes will buffer up
         // with out throwing any error (till a timeout) when internet
@@ -255,7 +265,7 @@ impl MqttState {
         // secs and then error out because of timeout.)
         if self.await_pingresp {
             debug!("Already expecting a pingresp");
-            return Err(ErrorKind::InvalidState.into());
+            bail!(anyhow!("Invalid state"))
         }
 
         if self.connection_status == MqttConnectionStatus::Connected {
@@ -268,7 +278,7 @@ impl MqttState {
                 "State = {:?}. Shouldn't ping in this state",
                 self.connection_status
             );
-            Err(ErrorKind::InvalidState.into())
+            bail!(anyhow!("Invalid state"))
         }
     }
 
@@ -281,12 +291,11 @@ impl MqttState {
         subs: Vec<crate::client::Subscription>,
     ) -> Result<mqtt3::Subscribe> {
         let pkid = self.next_pkid();
-        let topics = subs.iter()
-            .map(|s| {
-                ::mqtt3::SubscribeTopic {
-                    topic_path: s.topic_path.path.clone(),
-                    qos: s.qos,
-                }
+        let topics = subs
+            .iter()
+            .map(|s| ::mqtt3::SubscribeTopic {
+                topic_path: s.topic_path.path.clone(),
+                qos: s.qos,
             })
             .collect();
         self.subscriptions.extend(subs);
@@ -298,17 +307,17 @@ impl MqttState {
                 "State = {:?}. Shouldn't subscribe in this state",
                 self.connection_status
             );
-            Err(ErrorKind::InvalidState.into())
+            bail!(anyhow!("Invalid state"))
         }
     }
 
-
     pub fn handle_incoming_suback(&mut self, ack: mqtt3::Suback) -> Result<()> {
-        if ack.return_codes
+        if ack
+            .return_codes
             .iter()
             .any(|v| *v == ::mqtt3::SubscribeReturnCodes::Failure)
         {
-            Err(format!("rejected subscription"))?
+            bail!(anyhow!("rejected subscription"))
         };
         Ok(())
     }
@@ -345,9 +354,8 @@ mod test {
     use std::time::Duration;
 
     use super::{MqttConnectionStatus, MqttState};
-    use mqtt3::*;
     use crate::options::MqttOptions;
-    use crate::error::*;
+    use mqtt3::*;
 
     #[test]
     fn next_pkid_roll() {
@@ -380,7 +388,6 @@ mod test {
         // publish shouldn't added to queue
         assert_eq!(mqtt.outgoing_pub.len(), 0);
 
-
         // QoS1 Publish
         let publish = Publish {
             dup: false,
@@ -404,18 +411,6 @@ mod test {
         assert_eq!(mqtt.outgoing_pub.len(), 2);
     }
 
-    macro_rules! assert_error_kind {
-        ($expr:expr, $kind:path) => {
-            match $expr {
-                Err(e) => match e {
-                    Error($kind, _) => {}
-                    e => panic!("Wrong error. Expected {:?}, got {:?}", $kind, e),
-                }
-                Ok(_) => panic!("Expected error {:?}, got ok.", $kind),
-            }
-        }
-    }
-
     #[test]
     fn outgoing_publish_handle_should_throw_error_in_invalid_state() {
         let mut mqtt = MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883"));
@@ -430,7 +425,7 @@ mod test {
         };
 
         let publish_out = mqtt.handle_outgoing_publish(publish);
-        assert_error_kind!(publish_out, ErrorKind::InvalidState);
+        assert!(publish_out.is_err());
     }
 
     #[test]
@@ -447,7 +442,7 @@ mod test {
         };
 
         let err = mqtt.handle_outgoing_publish(publish);
-        assert_error_kind!(err, ErrorKind::PacketSizeLimitExceeded);
+        assert!(err.is_err());
     }
 
     #[test]
@@ -486,7 +481,7 @@ mod test {
         let mut mqtt = MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883"));
         mqtt.opts.keep_alive = Some(5);
         thread::sleep(Duration::new(5, 0));
-        assert_error_kind!(mqtt.handle_outgoing_ping(), ErrorKind::InvalidState);
+        assert!(mqtt.handle_outgoing_ping().is_err());
     }
 
     #[test]
@@ -499,7 +494,7 @@ mod test {
         mqtt.handle_outgoing_ping().unwrap();
         thread::sleep(Duration::new(5, 0));
         // should throw error because we didn't get pingresp for previous ping
-        assert_error_kind!(mqtt.handle_outgoing_ping(), ErrorKind::InvalidState);
+        assert!(mqtt.handle_outgoing_ping().is_err());
     }
 
     #[test]
@@ -508,7 +503,7 @@ mod test {
         mqtt.opts.keep_alive = Some(5);
         mqtt.connection_status = MqttConnectionStatus::Connected;
         thread::sleep(Duration::new(7, 0));
-        assert_error_kind!(mqtt.handle_outgoing_ping(), ErrorKind::InvalidState);
+        assert!(mqtt.handle_outgoing_ping().is_err());
     }
 
     #[test]
@@ -527,7 +522,8 @@ mod test {
 
     #[test]
     fn disconnect_handle_should_reset_everything_in_clean_session() {
-        let mut mqtt = MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883").set_clean_session(true));
+        let mut mqtt =
+            MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883").set_clean_session(true));
         mqtt.await_pingresp = true;
         // QoS1 Publish
         let publish = Publish {
@@ -546,8 +542,8 @@ mod test {
         mqtt.handle_socket_disconnect();
         assert_eq!(mqtt.outgoing_pub.len(), 0);
         match mqtt.connection_status {
-            MqttConnectionStatus::WantConnect { .. } => {},
-            _ => panic!()
+            MqttConnectionStatus::WantConnect { .. } => {}
+            _ => panic!(),
         }
         assert_eq!(mqtt.await_pingresp, false);
     }
@@ -574,8 +570,8 @@ mod test {
         mqtt.handle_socket_disconnect();
         assert_eq!(mqtt.outgoing_pub.len(), 3);
         match mqtt.connection_status {
-            MqttConnectionStatus::WantConnect { .. } => {},
-            _ => panic!()
+            MqttConnectionStatus::WantConnect { .. } => {}
+            _ => panic!(),
         }
         assert_eq!(mqtt.await_pingresp, false);
     }
@@ -585,8 +581,8 @@ mod test {
         let mut mqtt = MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883"));
 
         match mqtt.connection_status {
-            MqttConnectionStatus::WantConnect { .. } => {},
-            _ => panic!()
+            MqttConnectionStatus::WantConnect { .. } => {}
+            _ => panic!(),
         }
         mqtt.handle_outgoing_connect(true);
         assert_eq!(
@@ -609,14 +605,15 @@ mod test {
 
         assert!(mqtt.handle_incoming_connack(connack).is_err());
         match mqtt.connection_status {
-            MqttConnectionStatus::WantConnect { .. } => {},
-            _ => panic!()
+            MqttConnectionStatus::WantConnect { .. } => {}
+            _ => panic!(),
         }
     }
 
     #[test]
     fn connack_handle_should_not_return_list_of_incomplete_messages_to_be_sent_in_clean_session() {
-        let mut mqtt = MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883").set_clean_session(true));
+        let mut mqtt =
+            MqttState::new(MqttOptions::new("test-id", "127.0.0.1:1883").set_clean_session(true));
 
         let publish = Publish {
             dup: false,

@@ -1,5 +1,4 @@
-use crate::error::*;
-
+use anyhow::{Result, Context, anyhow};
 use mqtt3::{QoS, ToTopicPath, TopicPath};
 
 use mio_more::channel::*;
@@ -121,18 +120,18 @@ impl MqttClient {
     pub fn status(&self) -> Result<crate::state::MqttConnectionStatus> {
         let (tx, rx) = ::std::sync::mpsc::channel();
         self.send_command(Command::Status(tx))?;
-        Ok(rx.recv().map_err(|_| "Client thread looks dead")?)
+        Ok(rx.recv().context("Client thread looks dead")?)
     }
 
     fn send_command(&self, command: Command) -> Result<()> {
         self.nw_request_tx
             .send(command)
-            .map_err(|_| "failed to send mqtt command to client thread")?;
+            .map_err(|err| anyhow!("failed to send mqtt command to client thread: {err}"))?;
         Ok(())
     }
 }
 
-pub type SubscriptionCallback = Box<Fn(&::mqtt3::Publish) + Send>;
+pub type SubscriptionCallback = Box<dyn Fn(&::mqtt3::Publish) + Send>;
 
 #[derive(DebugStub)]
 pub struct Subscription {

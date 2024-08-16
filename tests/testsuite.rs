@@ -5,17 +5,17 @@ extern crate loggerv;
 extern crate mqtt3;
 extern crate rumqtt;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mqtt3::{MqttRead, MqttWrite};
 use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
 
-#[cfg(feature="local-tests")]
+#[cfg(feature = "local-tests")]
 const MOSQUITTO_ADDR: &'static str = "localhost:11883";
-#[cfg(not(feature="local-tests"))]
+#[cfg(not(feature = "local-tests"))]
 const MOSQUITTO_ADDR: &'static str = "test.mosquitto.org:1883";
 
 /// Shouldn't try to reconnect if there is a connection problem
@@ -120,7 +120,9 @@ fn basic_publishes_and_subscribes() {
 #[test]
 fn alive() {
     // loggerv::init_with_level(log::LogLevel::Debug);
-    let client_options = MqttOptions::new("keep-alive", MOSQUITTO_ADDR).set_keep_alive(5).set_clean_session(true);
+    let client_options = MqttOptions::new("keep-alive", MOSQUITTO_ADDR)
+        .set_keep_alive(5)
+        .set_clean_session(true);
     let request = MqttClient::start(client_options).expect("Coudn't start");
     assert!(request.connected());
     std::thread::sleep(std::time::Duration::from_secs(10));
@@ -262,7 +264,6 @@ fn will() {
     // assert!(1 == final_count.load(Ordering::SeqCst));
 }
 */
-
 
 /// Broker should retain published message on a topic and
 /// INSTANTLY publish them to new subscritions
@@ -486,7 +487,7 @@ fn qos2_stress_publish_with_reconnections() {
 */
 
 #[test]
-#[cfg(feature="local-tests")]
+#[cfg(feature = "local-tests")]
 fn tls() {
     let mut ssl = rumqtt::TlsOptions::new("localhost".into());
     ssl.cafile.push("tests/test-confs/ca.cert".into());
@@ -498,7 +499,7 @@ fn tls() {
 }
 
 #[test]
-#[cfg(feature="local-tests")]
+#[cfg(feature = "local-tests")]
 fn tls_pwd() {
     let mut ssl = rumqtt::TlsOptions::new("localhost".into());
     ssl.cafile.push("tests/test-confs/ca.cert".into());
@@ -512,11 +513,14 @@ fn tls_pwd() {
 }
 
 #[test]
-#[cfg(feature="local-tests")]
+#[cfg(feature = "local-tests")]
 fn tls_cert() {
     let mut ssl = rumqtt::TlsOptions::new("localhost".into());
     ssl.cafile.push("tests/test-confs/ca.cert".into());
-    ssl.client_certs_key = Some(("tests/test-confs/client.cert".into(), "tests/test-confs/client.key".into()));
+    ssl.client_certs_key = Some((
+        "tests/test-confs/client.cert".into(),
+        "tests/test-confs/client.key".into(),
+    ));
     let client_options = MqttOptions::new("keep-alive", "localhost:18886")
         .set_keep_alive(5)
         .set_tls_opts(Some(ssl));
@@ -524,7 +528,7 @@ fn tls_cert() {
     simple_ping_pong(client);
 }
 
-#[cfg(feature="local-tests")]
+#[cfg(feature = "local-tests")]
 fn simple_ping_pong(client: MqttClient) {
     let count = Arc::new(AtomicUsize::new(0));
     let final_count = count.clone();
@@ -618,7 +622,6 @@ fn simple_ping_pong(client: MqttClient) {
 // }
 */
 
-
 fn spawn_silent_server(port: u16) {
     use std::io::Read;
     let server = ::std::net::TcpListener::bind(("localhost", port)).unwrap();
@@ -662,4 +665,3 @@ fn spawn_server_that_drops_connection_after_three_secs(port: u16) {
     });
     std::thread::sleep(std::time::Duration::from_secs(1));
 }
-

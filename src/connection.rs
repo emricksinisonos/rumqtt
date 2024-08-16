@@ -1,18 +1,21 @@
-use std::io::{ Read, Write};
+use std::convert::TryFrom;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mqtt3;
+use anyhow::{Result, anyhow, Context};
 use mio;
 use mio_more::channel::*;
+use mqtt3;
 
-use rustls::{ ClientSession, Session };
+use rustls::pki_types::ServerName;
+use rustls::ClientConnection;
 
-use crate::MqttOptions;
-use crate::state::MqttState;
-use crate::error::*;
-use crate::options;
 use crate::client::Command;
+use crate::options;
+use crate::state::MqttState;
+use crate::MqttOptions;
 
 pub enum Connection {
     Tcp {
@@ -21,17 +24,20 @@ pub enum Connection {
         connection: mio::net::TcpStream,
     },
     Tls {
-        tls_session: ClientSession,
+        tls_session: ClientConnection,
         connection: mio::net::TcpStream,
-    }
+    },
 }
 
 impl Connection {
-    fn wrap(connection: mio::net::TcpStream, tls:Option<&options::TlsOptions>) -> Result<Connection> {
+    fn wrap(
+        connection: mio::net::TcpStream,
+        tls: Option<&options::TlsOptions>,
+    ) -> Result<Connection> {
         if let Some(ref tls) = tls.as_ref() {
-            let hostname = webpki::DNSNameRef::try_from_ascii_str(&tls.hostname)
-                .map_err(|_| ErrorKind::InvalidDnsName)?;
-            let tls_session = ClientSession::new(&::std::sync::Arc::new(tls.to_rustls_config()?), hostname);
+            let hostname_str = tls.hostname.clone();
+            let hostname = ServerName::try_from(hostname_str)?;
+            let tls_session = ClientConnection::new(Arc::new(tls.to_rustls_config()?), hostname)?;
             Ok(Connection::Tls {
                 connection,
                 tls_session,
@@ -44,13 +50,18 @@ impl Connection {
             })
         }
     }
-    fn enqueue_data(&mut self, buffer:&[u8]) -> Result<()> {
+    fn enqueue_data(&mut self, buffer: &[u8]) -> Result<()> {
         match self {
-            &mut Connection::Tcp {ref mut out_buffer, ..} => {
+            &mut Connection::Tcp {
+                ref mut out_buffer, ..
+            } => {
                 out_buffer.extend(buffer);
             }
-            &mut Connection::Tls {ref mut tls_session, ..} => {
-                tls_session.write(buffer)?;
+            &mut Connection::Tls {
+                ref mut tls_session,
+                ..
+            } => {
+                tls_session.writer().write_all(buffer)?;
             }
         };
         trace!("Wants send ? {:?}", self.wants_send());
@@ -58,27 +69,32 @@ impl Connection {
     }
     fn manage_result(it: ::std::io::Result<usize>) -> Result<usize> {
         match it {
-            Ok(0) => Err("socket closed")?,
+            Ok(0) => Err(anyhow!("socket closed")),
             Ok(n) => Ok(n),
             Err(ref e) if e.kind() == ::std::io::ErrorKind::WouldBlock => Ok(0),
             Err(e) => Err(e.into()),
         }
     }
-    fn recv_data(&mut self, buffer:&mut [u8]) -> Result<usize> {
+    fn recv_data(&mut self, buffer: &mut [u8]) -> Result<usize> {
         match self {
-            &mut Connection::Tcp {ref mut connection, ..} => Self::manage_result(connection.read(buffer)),
-            &mut Connection::Tls {ref mut tls_session, ref mut connection} => {
+            &mut Connection::Tcp {
+                ref mut connection, ..
+            } => Self::manage_result(connection.read(buffer)),
+            &mut Connection::Tls {
+                ref mut tls_session,
+                ref mut connection,
+            } => {
                 if tls_session.wants_read() {
                     if Self::manage_result(tls_session.read_tls(connection))? == 0 {
                         trace!("recv_data: read_tls returned 0");
-                        return Ok(0)
+                        return Ok(0);
                     }
                 }
                 tls_session.process_new_packets()?;
                 if tls_session.wants_write() {
                     tls_session.write_tls(connection)?;
                 }
-                let read = tls_session.read(buffer)?;
+                let read = tls_session.reader().read(buffer)?;
                 trace!("recv_data: tls_session.read returned {:?}", read);
                 Ok(read)
             }
@@ -87,7 +103,11 @@ impl Connection {
     fn send_data(&mut self) -> Result<usize> {
         trace!("Trying to send bytes");
         match self {
-            &mut Connection::Tcp {ref mut out_buffer, ref mut connection, ref mut out_written} => {
+            &mut Connection::Tcp {
+                ref mut out_buffer,
+                ref mut connection,
+                ref mut out_written,
+            } => {
                 trace!("out_buffer: {}", out_buffer.len());
                 trace!("out_written: {}", out_written);
                 let written = Self::manage_result(connection.write(&out_buffer[*out_written..]))?;
@@ -99,20 +119,32 @@ impl Connection {
                 }
                 Ok(written)
             }
-            &mut Connection::Tls {ref mut tls_session, ref mut connection} => 
-                Self::manage_result(tls_session.write_tls(connection))
+            &mut Connection::Tls {
+                ref mut tls_session,
+                ref mut connection,
+            } => Self::manage_result(tls_session.write_tls(connection)),
         }
     }
     fn wants_send(&self) -> bool {
         match self {
-            &Connection::Tcp {ref out_buffer, ref out_written, ..} => out_buffer.len() > *out_written,
-            &Connection::Tls {ref tls_session, ..} => tls_session.wants_write(),
+            &Connection::Tcp {
+                ref out_buffer,
+                ref out_written,
+                ..
+            } => out_buffer.len() > *out_written,
+            &Connection::Tls {
+                ref tls_session, ..
+            } => tls_session.wants_write(),
         }
     }
     fn mio_connection(&mut self) -> &mut mio::net::TcpStream {
         match self {
-            &mut Connection::Tcp {ref mut connection, ..} => connection,
-            &mut Connection::Tls {ref mut connection, ..} => connection,
+            &mut Connection::Tcp {
+                ref mut connection, ..
+            } => connection,
+            &mut Connection::Tls {
+                ref mut connection, ..
+            } => connection,
         }
     }
 }
@@ -153,7 +185,7 @@ impl ConnectionState {
                 .next()
                 .unwrap()
                 .parse()
-                .map_err(|_| "Failed to parse port number")?;
+                .context("Failed to parse port number")?;
             (host, Some(port))
         } else {
             (broker, None)
@@ -161,7 +193,7 @@ impl ConnectionState {
         trace!("Connecting to broker:{} -> {}:{:?}", broker, host, port);
         let ips = ::dns_lookup::lookup_host(host)?;
         ips.into_iter()
-            .filter_map(|ip| {
+            .find_map(|ip| {
                 let addr: SocketAddr = SocketAddr::new(ip, port.unwrap_or(1883));
                 match mio::net::TcpStream::connect(&addr) {
                     Ok(ok) => Some(ok),
@@ -171,8 +203,7 @@ impl ConnectionState {
                     }
                 }
             })
-            .next()
-            .ok_or("Failed to connect to broker".into())
+            .ok_or(anyhow!("Failed to connect to broker"))
     }
 
     fn new(mut mqtt_state: MqttState, commands_rx: Receiver<Command>) -> Result<ConnectionState> {
@@ -262,7 +293,7 @@ impl ConnectionState {
         while self.state().status() != crate::state::MqttConnectionStatus::Connected {
             let now = Instant::now();
             if now > time_limit {
-                Err(format!(
+                Err(anyhow!(
                     "Timeout: no connack after {:?}",
                     self.state().opts().mqtt_connection_timeout
                 ))?
@@ -288,7 +319,7 @@ impl ConnectionState {
             while self.connection.wants_send() {
                 match self.connection.send_data() {
                     Ok(0) => return Ok(()),
-                    Ok(_) => {/* try to send more */} ,
+                    Ok(_) => { /* try to send more */ }
                     Err(e) => {
                         self.mqtt_state.handle_socket_disconnect();
                         return Err(e);
@@ -299,11 +330,11 @@ impl ConnectionState {
                 Ok(packet) => {
                     use mqtt3::MqttWrite;
                     debug!("Send: {:?}", packet);
-                    let mut buf = ::std::io::Cursor::new(vec!());
+                    let mut buf = ::std::io::Cursor::new(vec![]);
                     buf.write_packet(&packet)?;
                     self.connection.enqueue_data(&buf.into_inner())?
                 }
-                Err(::std::sync::mpsc::TryRecvError::Empty) => {return Ok(())},
+                Err(::std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(e) => Err(e)?,
             }
         }
@@ -339,12 +370,14 @@ impl ConnectionState {
                 trace!("resize {} - {}", self.in_buffer.len(), self.in_read * 2);
                 self.in_buffer.resize(self.in_read * 2, 0);
             }
-            let read = self.connection.recv_data(&mut self.in_buffer[self.in_read..]);
+            let read = self
+                .connection
+                .recv_data(&mut self.in_buffer[self.in_read..]);
             trace!("read: {:?}", read);
             match read {
                 Err(e) => {
                     self.mqtt_state.handle_socket_disconnect();
-                    return Err(e)
+                    return Err(e);
                 }
                 Ok(0) => return Ok(()),
                 Ok(read) => {
@@ -356,7 +389,9 @@ impl ConnectionState {
                         let packet = (&self.in_buffer[used..]).read_packet()?;
                         used += packet_size;
                         match packet {
-                            mqtt3::Packet::Publish(ref msg) => debug!("{} Received message on {}", self.id(), msg.topic_name),
+                            mqtt3::Packet::Publish(ref msg) => {
+                                debug!("{} Received message on {}", self.id(), msg.topic_name)
+                            }
                             ref msg => debug!("{} Received control message {:?}", self.id(), msg),
                         };
                         self.handle_incoming_packet(packet)?
@@ -381,7 +416,7 @@ impl ConnectionState {
                 self.mqtt_state.handle_incoming_connack(connack)?;
                 if let Some(state) = self.mqtt_state.handle_reconnection() {
                     trace!("State refresh after reco: {:?}", state);
-                    for msg in state.0 {
+                    if let Some(msg) = state.0 {
                         self.send_packet(mqtt3::Packet::Subscribe(msg))?;
                     }
                     for msg in state.1 {
@@ -450,8 +485,7 @@ impl ConnectionState {
 
     fn send_packet(&mut self, packet: ::mqtt3::Packet) -> Result<()> {
         self.out_packets_tx
-            .send(packet)
-            .map_err(|e| format!("mqtt3 internal send error: {:?}", e))?;
+            .send(packet)?;
         self.turn_outgoing()
     }
 }

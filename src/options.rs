@@ -1,7 +1,9 @@
-use std::time::Duration;
-use std::{ fs, io, path };
+use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, Mutex};
-use crate::error::Result;
+use std::time::Duration;
+use std::{fs, io, path};
+
+//use crate::error::Result;
 
 use crate::RustlsConfig;
 
@@ -24,48 +26,66 @@ pub struct TlsOptions {
     pub disable_root_store: bool,
     pub cafile: Vec<path::PathBuf>,
     pub capath: Vec<path::PathBuf>,
-    pub client_certs_key: Option<(path::PathBuf,path::PathBuf)>
+    pub client_certs_key: Option<(path::PathBuf, path::PathBuf)>,
 }
 
 impl TlsOptions {
     pub fn new(hostname: String) -> TlsOptions {
-        TlsOptions { hostname, disable_root_store: false, cafile: vec!(), capath: vec!(), client_certs_key: None }
+        TlsOptions {
+            hostname,
+            disable_root_store: false,
+            cafile: vec![],
+            capath: vec![],
+            client_certs_key: None,
+        }
+    }
+
+    fn root_store(&self) -> Result<rustls::RootCertStore> {
+        let mut root_store = rustls::RootCertStore::empty();
+
+        for cafile in &self.cafile {
+            let mut pem = io::BufReader::new(fs::File::open(cafile)?);
+            rustls_pemfile::certs(&mut pem)
+                .map(|it| root_store.add(it.unwrap()).map_err(|it| anyhow!(it)))
+                .collect::<Result<()>>()?;
+        }
+
+        for capath in &self.capath {
+            for entry in fs::read_dir(capath)? {
+                let entry = entry?;
+                let mut pem = io::BufReader::new(fs::File::open(entry.path())?);
+                rustls_pemfile::certs(&mut pem)
+                    .map(|it| root_store.add(it.unwrap()).map_err(|it| anyhow!(it)))
+                    .collect::<Result<()>>()?;
+            }
+        }
+
+        if !self.disable_root_store {
+            root_store.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
+        }
+
+        Ok(root_store)
     }
 
     pub fn to_rustls_config(&self) -> Result<RustlsConfig> {
-        let mut it = RustlsConfig::new();
-        fn add_cafile(it:&mut RustlsConfig, cafile: &path::Path) -> Result<()> {
-            let mut f = io::BufReader::new(fs::File::open(cafile)?);
-            it.root_store.add_pem_file(&mut f)
-                .map_err(|_| format!("Could not read pem file: {:?}", cafile))?;
-            Ok(())
-        }
-        for cafile in &self.cafile {
-            add_cafile(&mut it, cafile)?;
-        }
-        for capath in &self.capath {
-            for cafile in fs::read_dir(capath)? {
-                add_cafile(&mut it, &cafile?.path())?;
-            }
-        }
-        if !self.disable_root_store {
-            it.root_store.add_server_trust_anchors(&::webpki_roots::TLS_SERVER_ROOTS);
-        }
-        if let Some((ref c, ref k)) = self.client_certs_key {
-            let mut f = io::BufReader::new(fs::File::open(c)?);
-            let certs = ::rustls::internal::pemfile::certs(&mut f)
-                .map_err(|_| format!("Could not read client cert pem file: {:?}", c))?;
-            let mut key = io::BufReader::new(fs::File::open(k)?);
-            let mut key = ::rustls::internal::pemfile::pkcs8_private_keys(&mut key)
-                .map_err(|_| format!("Could not read client key file: {:?}", k))?;
-            let key = key.remove(0);
-            it.set_single_client_cert(certs, key);
-        }
-        Ok(it)
+        let it = RustlsConfig::builder().with_root_certificates(self.root_store()?);
+
+        let config = if let Some((ref c, ref k)) = self.client_certs_key {
+            let certs = rustls_pemfile::certs(&mut io::BufReader::new(fs::File::open(c)?))
+                .map(|it| it.map_err(|it| anyhow!(it)))
+                .collect::<Result<_>>()?;
+            let keys = rustls_pemfile::private_key(&mut io::BufReader::new(fs::File::open(k)?))
+                .map(|it| it.context(anyhow!("err")))??;
+            it.with_client_auth_cert(certs, keys)?
+        } else {
+            it.with_no_client_auth()
+        };
+
+        Ok(config)
     }
 }
 
-#[derive(Clone,Default)]
+#[derive(Clone, Default)]
 pub struct MqttOptions {
     /// broker address that you want to connect to
     pub broker_addr: String,
@@ -89,7 +109,7 @@ pub struct MqttOptions {
     pub last_will: Option<::mqtt3::LastWill>,
     /// TLS configuration
     pub tls: Option<TlsOptions>,
-    error_callback: Option<Arc<Mutex<FnMut() + Send>>>,
+    error_callback: Option<Arc<Mutex<dyn FnMut() + Send>>>,
 }
 
 impl MqttOptions {
@@ -172,7 +192,7 @@ impl MqttOptions {
     }
 
     /// Get a reference of the callback
-    pub fn get_disconnected_callback(&self) -> Option<Arc<Mutex<FnMut() + Send>>> {
+    pub fn get_disconnected_callback(&self) -> Option<Arc<Mutex<dyn FnMut() + Send>>> {
         self.error_callback.as_ref().map(Arc::clone)
     }
 }
